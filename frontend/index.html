@@ -1,0 +1,427 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>Reverse Snake - Multiplayer</title>
+<script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+<style>
+  :root { --bg:#1d2740; --arena:#eef3f8; --ink:#e8eefc; }
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--ink);
+    font-family:system-ui,-apple-system,"Segoe UI",sans-serif;
+    overscroll-behavior:none; touch-action:none; user-select:none; -webkit-user-select:none; }
+  body { display:flex; flex-direction:column; align-items:center; justify-content:center; gap:10px; }
+  #hud { display:flex; justify-content:space-between; font-size:15px; width:100%; max-width:600px; }
+  canvas { display:block; border-radius:6px; background:var(--arena); }
+
+  .panel { background:#2a3856; padding:30px; border-radius:12px; width:320px; text-align:center; }
+  .panel h1 { margin:0 0 20px 0; font-size:24px; }
+  .panel input { width:100%; padding:10px; margin-bottom:10px; border-radius:6px; border:1px solid #445; background:#1a2438; color:#fff; font-size:16px; box-sizing:border-box; }
+  .panel button { width:100%; padding:12px; border-radius:6px; border:none; background:#ff4f79; color:#fff; font-size:16px; font-weight:bold; cursor:pointer; margin-bottom:10px; }
+  .panel button:hover { background:#e63963; }
+  .panel .secondary { background:#4fc3f7; }
+  .panel .secondary:hover { background:#29b6f6; }
+  .code-display { font-size:32px; font-weight:bold; letter-spacing:8px; color:#ffb74d; margin:20px 0; }
+  .players-list { text-align:left; margin:20px 0; }
+  .player-item { padding:8px; margin:4px 0; border-radius:4px; background:#1a2438; }
+  .error { color:#ff4f79; font-size:14px; margin-top:10px; }
+  .hidden { display:none !important; }
+
+  #stick {
+    position:fixed; left:50%; bottom:24px; transform:translateX(-50%);
+    width:140px; height:140px; border-radius:50%;
+    background:rgba(255,255,255,0.08);
+    border:2px solid rgba(255,255,255,0.15);
+    touch-action:none; display:none;
+  }
+  #stick.on { display:block; }
+  #knob {
+    position:absolute; left:50%; top:50%; width:56px; height:56px;
+    margin:-28px 0 0 -28px; border-radius:50%;
+    background:rgba(255,255,255,0.35);
+    border:2px solid rgba(255,255,255,0.5);
+  }
+  #stick.active #knob { background:rgba(255,255,255,0.55); }
+</style>
+</head>
+<body>
+
+<div id="lobby" class="panel">
+  <h1>Reverse Snake</h1>
+  <input type="text" id="nameInput" placeholder="Your name" maxlength="20">
+  <button onclick="createRoom()">Create Room</button>
+  <button class="secondary" onclick="showJoin()">Join Room</button>
+
+  <div id="joinSection" class="hidden">
+    <input type="text" id="codeInput" placeholder="Room code" maxlength="6" style="text-transform:uppercase;">
+    <button onclick="joinRoom()">Join</button>
+  </div>
+
+  <div id="errorMsg" class="error"></div>
+</div>
+
+<div id="waiting" class="panel hidden">
+  <h1>Waiting Room</h1>
+  <p>Room Code:</p>
+  <div class="code-display" id="roomCode"></div>
+  <p>Share this code with friends!</p>
+  <div class="players-list" id="playersList"></div>
+  <button id="startBtn" onclick="startGame()">Start Game</button>
+  <p style="font-size:12px;color:#889;">Wait for at least 1 more player</p>
+</div>
+
+<div id="game" class="hidden">
+  <div id="graceMsg" style="display:none; color:#ffb74d; font-weight:bold; font-size:18px; margin-bottom:5px;"></div>
+  <div id="hud">
+      <span id="time">0.0 s</span>
+      <span id="aliveCount">-</span>
+      <span id="myColor">You</span>
+  </div>
+  <canvas id="c"></canvas>
+</div>
+
+<div id="gameover" class="panel hidden">
+  <h1 id="resultTitle">Game Over</h1>
+  <div id="resultText"></div>
+  <button onclick="location.reload()">Play Again</button>
+</div>
+
+<div id="stick"><div id="knob"></div></div>
+
+<script>
+let socket = null;
+let roomCode = null;
+let myColor = null;
+let mySocketId = null;
+let gameState = null;
+let myDirection = [0, 0];
+
+const GRID_SIZE = 40;
+
+const SNAKE_STYLES = [
+  { head: '#0f4c3a', body: '#2e7d5b', size: 0.20, headSize: 0.08 },  // BIG (Snake 1)
+  { head: '#5d2f00', body: '#8d5524', size: 0.10, headSize: 0.04 },  // normal (Snake 2)
+  { head: '#4a0033', body: '#8e2a70', size: 0.10, headSize: 0.04 },  // normal (Snake 3)
+  { head: '#4a0000', body: '#8e2a2a', size: 0.10, headSize: 0.04 },  // normal (Snake 4)
+];
+
+const lobby = document.getElementById('lobby');
+const waiting = document.getElementById('waiting');
+const game = document.getElementById('game');
+const gameover = document.getElementById('gameover');
+const stick = document.getElementById('stick');
+const knob = document.getElementById('knob');
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d');
+
+let cell = 10;
+
+// ---------- SOCKET ----------
+function connectSocket() {
+  socket = io();
+
+  socket.on('connect', () => {
+    mySocketId = socket.id;
+    console.log('Connected:', mySocketId);
+  });
+
+  socket.on('room_created', (data) => {
+    roomCode = data.code;
+    myColor = data.color;
+    document.getElementById('roomCode').textContent = roomCode;
+    showWaiting(data.players);
+  });
+
+  socket.on('room_joined', (data) => {
+    roomCode = data.code;
+    myColor = data.color;
+    document.getElementById('roomCode').textContent = roomCode;
+    showWaiting(data.players);
+  });
+
+  socket.on('player_joined', (data) => renderPlayers(data.players));
+  socket.on('player_left', (data) => renderPlayers(data.players));
+
+  socket.on('game_started', (data) => {
+    gameState = data;
+    showGame();
+  });
+
+  socket.on('game_state', (data) => {
+    gameState = data;
+    draw();
+    updateHud();
+  });
+
+  socket.on('player_caught', (data) => {
+    console.log('Player caught:', data.player_id);
+  });
+
+  socket.on('game_over', (data) => showGameOver(data));
+
+  socket.on('error', (data) => {
+    document.getElementById('errorMsg').textContent = data.message;
+  });
+}
+
+// ---------- LOBBY ----------
+function createRoom() {
+  const name = document.getElementById('nameInput').value.trim() || 'Player';
+  if (!socket) connectSocket();
+  const tryCreate = () => socket.emit('create_room', { name });
+  if (socket.connected) tryCreate();
+  else socket.on('connect', tryCreate);
+}
+
+function showJoin() {
+  document.getElementById('joinSection').classList.toggle('hidden');
+}
+
+function joinRoom() {
+  const name = document.getElementById('nameInput').value.trim() || 'Player';
+  const code = document.getElementById('codeInput').value.trim().toUpperCase();
+  if (!code) return;
+  if (!socket) connectSocket();
+  const tryJoin = () => socket.emit('join_room', { code, name });
+  if (socket.connected) tryJoin();
+  else socket.on('connect', tryJoin);
+}
+
+function showWaiting(players) {
+  lobby.classList.add('hidden');
+  waiting.classList.remove('hidden');
+  renderPlayers(players);
+}
+
+function renderPlayers(players) {
+  const list = document.getElementById('playersList');
+  list.innerHTML = '';
+  players.forEach(p => {
+    const div = document.createElement('div');
+    div.className = 'player-item';
+    div.style.borderLeft = '4px solid ' + p.color;
+    div.textContent = p.name;
+    list.appendChild(div);
+  });
+  document.getElementById('startBtn').disabled = players.length < 1;
+}
+
+function startGame() {
+  socket.emit('start_game');
+}
+
+function showGame() {
+  waiting.classList.add('hidden');
+  lobby.classList.add('hidden');
+  game.classList.remove('hidden');
+  if (matchMedia('(pointer: coarse)').matches) stick.classList.add('on');
+  fit();
+}
+
+// ---------- CANVAS ----------
+function fit() {
+  const stickReserve = stick.classList.contains('on') ? 160 : 0;
+  const size = Math.floor(
+    Math.min(innerWidth - 16, innerHeight - 70 - stickReserve) / GRID_SIZE
+  ) * GRID_SIZE;
+  const dpr = window.devicePixelRatio || 1;
+  cv.style.width = cv.style.height = size + 'px';
+  cv.width = cv.height = size * dpr;
+  cell = (size * dpr) / GRID_SIZE;
+}
+
+function hexToRgba(hex, alpha) {
+  const r = parseInt(hex.slice(1, 3), 16);
+  const g = parseInt(hex.slice(3, 5), 16);
+  const b = parseInt(hex.slice(5, 7), 16);
+  return `rgba(${r},${g},${b},${alpha})`;
+}
+
+function draw() {
+  if (!gameState) return;
+  if (!cell || cell <= 0) return;
+
+  const w = cv.width;
+  ctx.clearRect(0, 0, w, w);
+
+  ctx.strokeStyle = '#dbe4ee'; ctx.lineWidth = 1;
+  ctx.beginPath();
+  for (let i = 1; i < GRID_SIZE; i++) {
+    ctx.moveTo(i * cell, 0); ctx.lineTo(i * cell, w);
+    ctx.moveTo(0, i * cell); ctx.lineTo(w, i * cell);
+  }
+  ctx.stroke();
+
+  const inGrace = gameState.grace_remaining > 0;
+
+  (gameState.snakes || []).forEach(snake => {
+    const style = SNAKE_STYLES[snake.config_index] || SNAKE_STYLES[0];
+    snake.body.forEach((c, i) => {
+      if (inGrace) {
+        ctx.fillStyle = hexToRgba(style.head, 0.3);
+      } else {
+        ctx.fillStyle = i === 0 ? style.head : style.body;
+      }
+      const pad = i === 0 ? cell * style.headSize : cell * style.size;
+      ctx.fillRect(c.x * cell + pad, c.y * cell + pad, cell - pad * 2, cell - pad * 2);
+    });
+  });
+
+  const safeRadius = Math.max(1, cell * 0.4);
+
+  Object.entries(gameState.players).forEach(([sid, p]) => {
+    if (!p.ball.alive) return;
+    const isMe = sid === mySocketId;
+    const cx = (p.ball.x + 0.5) * cell;
+    const cy = (p.ball.y + 0.5) * cell;
+    const r = safeRadius;
+
+    ctx.fillStyle = p.color;
+    ctx.beginPath();
+    ctx.arc(cx, cy, r, 0, Math.PI * 2);
+    ctx.fill();
+
+    if (isMe) {
+      ctx.strokeStyle = '#fff';
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.arc(cx, cy, r, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+  });
+}
+
+function updateHud() {
+  if (!gameState) return;
+  document.getElementById('time').textContent = gameState.elapsed + ' s';
+  const alive = Object.values(gameState.players).filter(p => p.ball.alive).length;
+  document.getElementById('aliveCount').textContent = alive + ' alive';
+
+  const graceEl = document.getElementById('graceMsg');
+  if (gameState.grace_remaining > 0) {
+    graceEl.style.display = 'block';
+    graceEl.textContent = '🐍 Snake starts in ' + gameState.grace_remaining + 's';
+  } else {
+    graceEl.style.display = 'none';
+  }
+
+  const me = gameState.players[mySocketId];
+  if (me) {
+    if (me.ball.alive) {
+      document.getElementById('myColor').textContent = 'You (alive)';
+    } else {
+      document.getElementById('myColor').textContent = 'You: ' + me.survived_time + 's';
+    }
+    document.getElementById('myColor').style.color = myColor;
+  }
+}
+
+function showGameOver(data) {
+  game.classList.add('hidden');
+  gameover.classList.remove('hidden');
+
+  const isWinner = data.winner === mySocketId;
+  document.getElementById('resultTitle').textContent = isWinner ? '🏆 You Win!' : 'Game Over';
+
+  let html = '<div class="players-list">';
+  (data.results || []).forEach((r, i) => {
+    const isMe = r.socket_id === mySocketId;
+    const medal = i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : '  ';
+    html += `<div class="player-item" style="${isMe ? 'background:#2e7d5b;' : ''}">
+      ${medal} ${r.name} — ${r.time}s
+    </div>`;
+  });
+  html += '</div>';
+
+  document.getElementById('resultText').innerHTML = html;
+}
+
+// ---------- INPUT ----------
+const keys = new Set();
+addEventListener('keydown', e => {
+  if (!e.key) return;
+  const k = e.key.toLowerCase();
+  if (['arrowup','arrowdown','arrowleft','arrowright',' '].includes(k)) e.preventDefault();
+  keys.add(k);
+});
+addEventListener('keyup', e => {
+  if (!e.key) return;
+  keys.delete(e.key.toLowerCase());
+});
+
+function readKeyboardDir() {
+  const dx = (keys.has('arrowright') || keys.has('d') ? 1 : 0)
+           - (keys.has('arrowleft')  || keys.has('a') ? 1 : 0);
+  const dy = (keys.has('arrowdown')  || keys.has('s') ? 1 : 0)
+           - (keys.has('arrowup')    || keys.has('w') ? 1 : 0);
+  return [dx, dy];
+}
+
+let stickActive = false, stickVector = [0, 0];
+const STICK_MAX = 50;
+const STICK_DEAD = 8;
+
+function setKnob(dx, dy) {
+  knob.style.transform = `translate(${dx}px, ${dy}px)`;
+}
+
+function updateStickVector(dx, dy) {
+  const len = Math.hypot(dx, dy);
+  if (len < STICK_DEAD) { stickVector = [0, 0]; return; }
+  const clamped = Math.min(len, STICK_MAX);
+  const nx = dx / len, ny = dy / len;
+  setKnob(nx * clamped, ny * clamped);
+  if (Math.abs(nx) > Math.abs(ny)) stickVector = [Math.sign(nx), 0];
+  else                             stickVector = [0, Math.sign(ny)];
+}
+
+stick.addEventListener('pointerdown', e => {
+  stickActive = true;
+  stick.classList.add('active');
+  stick.setPointerCapture(e.pointerId);
+  const r = stick.getBoundingClientRect();
+  const cx = e.clientX - r.left - r.width / 2;
+  const cy = e.clientY - r.top - r.height / 2;
+  updateStickVector(cx, cy);
+});
+
+stick.addEventListener('pointermove', e => {
+  if (!stickActive) return;
+  const r = stick.getBoundingClientRect();
+  const cx = e.clientX - r.left - r.width / 2;
+  const cy = e.clientY - r.top - r.height / 2;
+  updateStickVector(cx, cy);
+});
+
+function endStick(e) {
+  if (!stickActive) return;
+  stickActive = false;
+  stick.classList.remove('active');
+  stickVector = [0, 0];
+  setKnob(0, 0);
+  try { stick.releasePointerCapture(e.pointerId); } catch(_) {}
+}
+stick.addEventListener('pointerup', endStick);
+stick.addEventListener('pointercancel', endStick);
+
+function sendInput() {
+  if (!socket || !socket.connected) return;
+  if (gameState?.status !== 'playing') return;
+
+  const [kx, ky] = readKeyboardDir();
+  let dir = (kx || ky) ? [kx, ky] : stickVector;
+
+  if (dir[0] !== myDirection[0] || dir[1] !== myDirection[1]) {
+    myDirection = dir;
+    socket.emit('input', { dx: dir[0], dy: dir[1] });
+  }
+}
+
+setInterval(sendInput, 50);
+
+// ---------- BOOT ----------
+connectSocket();
+addEventListener('resize', fit);
+</script>
+</body>
+</html>
